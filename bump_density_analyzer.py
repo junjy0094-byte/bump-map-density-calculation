@@ -43,9 +43,6 @@ class BumpDensityAnalyzer:
         # 합집합 그룹: set of rectangle indices
         self.union_groups = []  # list of sets, e.g. [{0,1}, {2,3}]
 
-        # 꼭지점 좌표 라벨 리스트 (각 사각형마다 4개 텍스트)
-        self.rect_corner_labels = []  # list of [txt_bl, txt_br, txt_tr, txt_tl]
-
         # UI 상태
         self._drawing = False
         self._current_selector = None
@@ -57,6 +54,7 @@ class BumpDensityAnalyzer:
         self._resize_active = False
         self._resize_rect_idx = None   # 리사이즈 중인 사각형 인덱스
         self._resize_edge = None       # 'left', 'right', 'top', 'bottom'
+        self._hover_rect_idx = None    # 현재 하이라이트 중인 사각형 인덱스
 
     def _setup_bounds(self, x_min, x_max, y_min, y_max):
         """바운드 설정: 커스텀 또는 자동(최외곽 범프 + pitch/2)"""
@@ -274,10 +272,6 @@ class BumpDensityAnalyzer:
                            fontsize=12, fontweight='bold', color=color, zorder=10)
         self.rect_labels.append(txt)
 
-        # 꼭지점 좌표 라벨
-        corner_texts = self._create_corner_labels(idx - 1)
-        self.rect_corner_labels.append(corner_texts)
-
         self._update_info()
         self.fig.canvas.draw_idle()
 
@@ -390,24 +384,27 @@ class BumpDensityAnalyzer:
                 self.fig.canvas.draw_idle()
 
     def _on_mouse_move(self, event):
-        """마우스 이동 - 리사이즈 중이면 사각형 업데이트, 아니면 커서 변경"""
+        """마우스 이동 - 리사이즈 중이면 사각형 업데이트"""
         if event.inaxes != self.ax or event.xdata is None:
             return
 
+        # 리사이즈 중이면 패치만 업데이트 (밀도 계산 없음)
         if self._resize_active:
             self._do_resize(event.xdata, event.ydata)
             return
 
-        # 변 근처면 커서 모양 변경 힌트 (패치 강조)
+        # draw 모드: 변 근처 하이라이트 (상태 변화 시만 redraw)
         if self._mode == 'draw' and self.rectangles:
             rect_idx, edge = self._detect_edge(event.xdata, event.ydata)
-            # 모든 사각형의 linestyle 복원 후, 해당 변이 있으면 점선으로 표시
-            for i, p in enumerate(self.rect_patches):
-                if i == rect_idx:
-                    p.set_linestyle('--')
-                else:
-                    p.set_linestyle('-')
-            self.fig.canvas.draw_idle()
+            if rect_idx != self._hover_rect_idx:
+                # 이전 하이라이트 복원
+                if self._hover_rect_idx is not None and self._hover_rect_idx < len(self.rect_patches):
+                    self.rect_patches[self._hover_rect_idx].set_linestyle('-')
+                # 새 하이라이트
+                if rect_idx is not None:
+                    self.rect_patches[rect_idx].set_linestyle('--')
+                self._hover_rect_idx = rect_idx
+                self.fig.canvas.draw_idle()
 
     def _on_mouse_release(self, event):
         """마우스 릴리즈 - 리사이즈 종료"""
@@ -461,9 +458,6 @@ class BumpDensityAnalyzer:
         # 라벨 위치 업데이트
         self.rect_labels[idx].set_position(((rx0 + rx1) / 2, (ry0 + ry1) / 2))
 
-        # 꼭지점 좌표 라벨 업데이트
-        self._update_corner_labels_for(idx)
-
         self.fig.canvas.draw_idle()
 
     def _on_undo(self, event):
@@ -471,13 +465,12 @@ class BumpDensityAnalyzer:
         if not self.rectangles:
             return
 
+        self._hover_rect_idx = None
         self.rectangles.pop()
         patch = self.rect_patches.pop()
         patch.remove()
         txt = self.rect_labels.pop()
         txt.remove()
-        # 꼭지점 라벨 제거
-        self._remove_corner_labels(len(self.rectangles))
 
         # 합집합 그룹에서도 제거
         removed_idx = len(self.rectangles)
@@ -493,17 +486,14 @@ class BumpDensityAnalyzer:
 
     def _on_clear_all(self, event):
         """모든 사각형 삭제"""
+        self._hover_rect_idx = None
         for p in self.rect_patches:
             p.remove()
         for t in self.rect_labels:
             t.remove()
-        for corner_txts in self.rect_corner_labels:
-            for t in corner_txts:
-                t.remove()
         self.rectangles.clear()
         self.rect_patches.clear()
         self.rect_labels.clear()
-        self.rect_corner_labels.clear()
         self.union_groups.clear()
         self._union_selection.clear()
 
@@ -578,50 +568,6 @@ class BumpDensityAnalyzer:
         self._update_info()
         self.fig.canvas.draw_idle()
 
-    # =========================================================================
-    # Corner coordinate labels
-    # =========================================================================
-
-    def _create_corner_labels(self, idx):
-        """사각형의 4개 꼭지점에 좌표 라벨 생성"""
-        x0, y0, x1, y1 = self.rectangles[idx]
-        color = self.rect_patches[idx].get_edgecolor()
-        fs = 7
-        corners = [
-            (x0, y0, 'left', 'top'),      # BL
-            (x1, y0, 'right', 'top'),     # BR
-            (x1, y1, 'right', 'bottom'),  # TR
-            (x0, y1, 'left', 'bottom'),   # TL
-        ]
-        texts = []
-        for cx, cy, ha, va in corners:
-            txt = self.ax.text(
-                cx, cy, f'({cx:.1f}, {cy:.1f})',
-                fontsize=fs, color=color, ha=ha, va=va,
-                bbox=dict(boxstyle='round,pad=0.15', facecolor='white',
-                          edgecolor=color, alpha=0.8, linewidth=0.5),
-                zorder=11
-            )
-            texts.append(txt)
-        return texts
-
-    def _update_corner_labels_for(self, idx):
-        """특정 사각형의 꼭지점 좌표 라벨 위치 및 텍스트 업데이트"""
-        if idx >= len(self.rect_corner_labels):
-            return
-        x0, y0, x1, y1 = self.rectangles[idx]
-        coords = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
-        for txt, (cx, cy) in zip(self.rect_corner_labels[idx], coords):
-            txt.set_position((cx, cy))
-            txt.set_text(f'({cx:.1f}, {cy:.1f})')
-
-    def _remove_corner_labels(self, idx):
-        """특정 사각형의 꼭지점 라벨 제거"""
-        if idx < len(self.rect_corner_labels):
-            for txt in self.rect_corner_labels[idx]:
-                txt.remove()
-            self.rect_corner_labels.pop(idx)
-
     def _reset_rect_highlights(self):
         """사각형 하이라이트 초기화"""
         for p in self.rect_patches:
@@ -665,6 +611,18 @@ class BumpDensityAnalyzer:
             rem_count, rem_density, rem_area = self.calc_remaining_density()
             lines.append(f"[Remaining] Density: {rem_density:.4f}%")
             lines.append(f"  Bumps: {rem_count}  Area: {rem_area:,.1f} μm²")
+
+            # 각 사각형 꼭지점 좌표
+            lines.append("")
+            lines.append("-" * 42)
+            lines.append("  VERTICES")
+            lines.append("-" * 42)
+            for idx, rect in enumerate(self.rectangles):
+                x0, y0, x1, y1 = rect
+                lines.append(f"R{idx+1}: ({x0:.1f},{y0:.1f})"
+                             f" ({x1:.1f},{y0:.1f})")
+                lines.append(f"    ({x0:.1f},{y1:.1f})"
+                             f" ({x1:.1f},{y1:.1f})")
 
         lines.append("=" * 42)
 
