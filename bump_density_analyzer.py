@@ -43,12 +43,20 @@ class BumpDensityAnalyzer:
         # 합집합 그룹: set of rectangle indices
         self.union_groups = []  # list of sets, e.g. [{0,1}, {2,3}]
 
+        # 꼭지점 좌표 라벨 리스트 (각 사각형마다 4개 텍스트)
+        self.rect_corner_labels = []  # list of [txt_bl, txt_br, txt_tr, txt_tl]
+
         # UI 상태
         self._drawing = False
         self._current_selector = None
         self._info_text = None
         self._mode = 'draw'  # 'draw' or 'union'
         self._union_selection = []  # 합집합 모드에서 선택된 사각형 인덱스
+
+        # 리사이즈 상태
+        self._resize_active = False
+        self._resize_rect_idx = None   # 리사이즈 중인 사각형 인덱스
+        self._resize_edge = None       # 'left', 'right', 'top', 'bottom'
 
     def _setup_bounds(self, x_min, x_max, y_min, y_max):
         """바운드 설정: 커스텀 또는 자동(최외곽 범프 + pitch/2)"""
@@ -266,6 +274,10 @@ class BumpDensityAnalyzer:
                            fontsize=12, fontweight='bold', color=color, zorder=10)
         self.rect_labels.append(txt)
 
+        # 꼭지점 좌표 라벨
+        corner_texts = self._create_corner_labels(idx - 1)
+        self.rect_corner_labels.append(corner_texts)
+
         self._update_info()
         self.fig.canvas.draw_idle()
 
@@ -291,8 +303,168 @@ class BumpDensityAnalyzer:
         self.btn_apply = Button(ax_apply, 'Apply Union')
         self.btn_apply.on_clicked(self._on_apply_union)
 
-        # 키보드 이벤트
-        self.fig.canvas.mpl_connect('button_press_event', self._on_click)
+        # 마우스 이벤트 (리사이즈 + 합집합 선택)
+        self.fig.canvas.mpl_connect('button_press_event', self._on_mouse_press)
+        self.fig.canvas.mpl_connect('motion_notify_event', self._on_mouse_move)
+        self.fig.canvas.mpl_connect('button_release_event', self._on_mouse_release)
+
+    # =========================================================================
+    # Edge resize
+    # =========================================================================
+
+    def _get_edge_tolerance(self):
+        """현재 줌 레벨에 맞는 변 감지 허용 거리(data 좌표 기준)"""
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        view_width = xlim[1] - xlim[0]
+        view_height = ylim[1] - ylim[0]
+        return max(view_width, view_height) * 0.012
+
+    def _detect_edge(self, mx, my):
+        """마우스 위치에서 가장 가까운 사각형 변을 감지.
+        Returns: (rect_idx, edge_name) or (None, None)
+        """
+        tol = self._get_edge_tolerance()
+        best = (None, None)
+        best_dist = tol
+
+        for idx, rect in enumerate(self.rectangles):
+            x0, y0, x1, y1 = rect
+            # 마우스가 사각형 주변에 있는지 대략 확인
+            if mx < x0 - tol or mx > x1 + tol or my < y0 - tol or my > y1 + tol:
+                continue
+
+            # 각 변까지 거리 계산 (해당 변의 범위 안에 있을 때만)
+            # left edge (x=x0)
+            if y0 - tol <= my <= y1 + tol:
+                d = abs(mx - x0)
+                if d < best_dist:
+                    best_dist = d
+                    best = (idx, 'left')
+            # right edge (x=x1)
+            if y0 - tol <= my <= y1 + tol:
+                d = abs(mx - x1)
+                if d < best_dist:
+                    best_dist = d
+                    best = (idx, 'right')
+            # bottom edge (y=y0)
+            if x0 - tol <= mx <= x1 + tol:
+                d = abs(my - y0)
+                if d < best_dist:
+                    best_dist = d
+                    best = (idx, 'bottom')
+            # top edge (y=y1)
+            if x0 - tol <= mx <= x1 + tol:
+                d = abs(my - y1)
+                if d < best_dist:
+                    best_dist = d
+                    best = (idx, 'top')
+
+        return best
+
+    def _on_mouse_press(self, event):
+        """마우스 클릭 - 리사이즈 시작 또는 합집합 선택"""
+        if event.inaxes != self.ax:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        # 합집합 모드
+        if self._mode == 'union':
+            self._on_union_click(event)
+            return
+
+        # draw 모드: 변 근처면 리사이즈 시작
+        if self._mode == 'draw' and event.button == 1 and self.rectangles:
+            rect_idx, edge = self._detect_edge(event.xdata, event.ydata)
+            if rect_idx is not None:
+                self._resize_active = True
+                self._resize_rect_idx = rect_idx
+                self._resize_edge = edge
+                # RectangleSelector 비활성화
+                if self._current_selector:
+                    self._current_selector.set_active(False)
+                # 리사이즈 중인 사각형 강조
+                self.rect_patches[rect_idx].set_linewidth(3)
+                self.rect_patches[rect_idx].set_linestyle(':')
+                self.fig.canvas.draw_idle()
+
+    def _on_mouse_move(self, event):
+        """마우스 이동 - 리사이즈 중이면 사각형 업데이트, 아니면 커서 변경"""
+        if event.inaxes != self.ax or event.xdata is None:
+            return
+
+        if self._resize_active:
+            self._do_resize(event.xdata, event.ydata)
+            return
+
+        # 변 근처면 커서 모양 변경 힌트 (패치 강조)
+        if self._mode == 'draw' and self.rectangles:
+            rect_idx, edge = self._detect_edge(event.xdata, event.ydata)
+            # 모든 사각형의 linestyle 복원 후, 해당 변이 있으면 점선으로 표시
+            for i, p in enumerate(self.rect_patches):
+                if i == rect_idx:
+                    p.set_linestyle('--')
+                else:
+                    p.set_linestyle('-')
+            self.fig.canvas.draw_idle()
+
+    def _on_mouse_release(self, event):
+        """마우스 릴리즈 - 리사이즈 종료"""
+        if not self._resize_active:
+            return
+
+        idx = self._resize_rect_idx
+        self._resize_active = False
+        self._resize_rect_idx = None
+        self._resize_edge = None
+
+        # 시각 복원
+        self.rect_patches[idx].set_linewidth(2)
+        self.rect_patches[idx].set_linestyle('-')
+
+        # RectangleSelector 재활성화
+        if self._current_selector:
+            self._current_selector.set_active(True)
+
+        self._update_info()
+        self.fig.canvas.draw_idle()
+
+    def _do_resize(self, mx, my):
+        """리사이즈 실행: 마우스 위치에 따라 사각형 변 이동"""
+        idx = self._resize_rect_idx
+        edge = self._resize_edge
+        x0, y0, x1, y1 = self.rectangles[idx]
+        bx0, by0, bx1, by1 = self.bounds
+
+        min_size = self._get_edge_tolerance() * 2  # 최소 크기
+
+        if edge == 'left':
+            new_x0 = max(bx0, min(mx, x1 - min_size))
+            self.rectangles[idx] = (new_x0, y0, x1, y1)
+        elif edge == 'right':
+            new_x1 = min(bx1, max(mx, x0 + min_size))
+            self.rectangles[idx] = (x0, y0, new_x1, y1)
+        elif edge == 'bottom':
+            new_y0 = max(by0, min(my, y1 - min_size))
+            self.rectangles[idx] = (x0, new_y0, x1, y1)
+        elif edge == 'top':
+            new_y1 = min(by1, max(my, y0 + min_size))
+            self.rectangles[idx] = (x0, y0, x1, new_y1)
+
+        # 패치 업데이트
+        rx0, ry0, rx1, ry1 = self.rectangles[idx]
+        self.rect_patches[idx].set_xy((rx0, ry0))
+        self.rect_patches[idx].set_width(rx1 - rx0)
+        self.rect_patches[idx].set_height(ry1 - ry0)
+
+        # 라벨 위치 업데이트
+        self.rect_labels[idx].set_position(((rx0 + rx1) / 2, (ry0 + ry1) / 2))
+
+        # 꼭지점 좌표 라벨 업데이트
+        self._update_corner_labels_for(idx)
+
+        self.fig.canvas.draw_idle()
 
     def _on_undo(self, event):
         """마지막 사각형 삭제"""
@@ -304,6 +476,8 @@ class BumpDensityAnalyzer:
         patch.remove()
         txt = self.rect_labels.pop()
         txt.remove()
+        # 꼭지점 라벨 제거
+        self._remove_corner_labels(len(self.rectangles))
 
         # 합집합 그룹에서도 제거
         removed_idx = len(self.rectangles)
@@ -323,9 +497,13 @@ class BumpDensityAnalyzer:
             p.remove()
         for t in self.rect_labels:
             t.remove()
+        for corner_txts in self.rect_corner_labels:
+            for t in corner_txts:
+                t.remove()
         self.rectangles.clear()
         self.rect_patches.clear()
         self.rect_labels.clear()
+        self.rect_corner_labels.clear()
         self.union_groups.clear()
         self._union_selection.clear()
 
@@ -351,15 +529,8 @@ class BumpDensityAnalyzer:
 
         self.fig.canvas.draw_idle()
 
-    def _on_click(self, event):
-        """클릭 이벤트 - 합집합 모드에서 사각형 선택"""
-        if self._mode != 'union':
-            return
-        if event.inaxes != self.ax:
-            return
-        if event.xdata is None or event.ydata is None:
-            return
-
+    def _on_union_click(self, event):
+        """합집합 모드에서 사각형 선택"""
         # 클릭한 위치가 어느 사각형 안인지 확인
         for idx, rect in enumerate(self.rectangles):
             x0, y0, x1, y1 = rect
@@ -406,6 +577,50 @@ class BumpDensityAnalyzer:
 
         self._update_info()
         self.fig.canvas.draw_idle()
+
+    # =========================================================================
+    # Corner coordinate labels
+    # =========================================================================
+
+    def _create_corner_labels(self, idx):
+        """사각형의 4개 꼭지점에 좌표 라벨 생성"""
+        x0, y0, x1, y1 = self.rectangles[idx]
+        color = self.rect_patches[idx].get_edgecolor()
+        fs = 7
+        corners = [
+            (x0, y0, 'left', 'top'),      # BL
+            (x1, y0, 'right', 'top'),     # BR
+            (x1, y1, 'right', 'bottom'),  # TR
+            (x0, y1, 'left', 'bottom'),   # TL
+        ]
+        texts = []
+        for cx, cy, ha, va in corners:
+            txt = self.ax.text(
+                cx, cy, f'({cx:.1f}, {cy:.1f})',
+                fontsize=fs, color=color, ha=ha, va=va,
+                bbox=dict(boxstyle='round,pad=0.15', facecolor='white',
+                          edgecolor=color, alpha=0.8, linewidth=0.5),
+                zorder=11
+            )
+            texts.append(txt)
+        return texts
+
+    def _update_corner_labels_for(self, idx):
+        """특정 사각형의 꼭지점 좌표 라벨 위치 및 텍스트 업데이트"""
+        if idx >= len(self.rect_corner_labels):
+            return
+        x0, y0, x1, y1 = self.rectangles[idx]
+        coords = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        for txt, (cx, cy) in zip(self.rect_corner_labels[idx], coords):
+            txt.set_position((cx, cy))
+            txt.set_text(f'({cx:.1f}, {cy:.1f})')
+
+    def _remove_corner_labels(self, idx):
+        """특정 사각형의 꼭지점 라벨 제거"""
+        if idx < len(self.rect_corner_labels):
+            for txt in self.rect_corner_labels[idx]:
+                txt.remove()
+            self.rect_corner_labels.pop(idx)
 
     def _reset_rect_highlights(self):
         """사각형 하이라이트 초기화"""
